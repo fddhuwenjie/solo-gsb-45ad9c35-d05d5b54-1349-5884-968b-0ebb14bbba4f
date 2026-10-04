@@ -88,6 +88,38 @@
         <span id="recalc-hint" class="recalc-hint" hidden>输入已变更，结果待重算…</span>
       </div>
 
+      <div class="card plan-card meet-card">
+        <h2>🤝 两人同车会合</h2>
+        <p class="hint" style="margin:-4px 0 12px;">
+          两人先到同一会合站、赶上同一班次，再同乘该班次直达共同终点；
+          候车分别计入两人。取解次序：共同到达 → 总步行 → 总候车 → 班次 ID → 会合站 ID。
+        </p>
+        <div class="meet-grid">
+          <div class="meet-person">
+            <h3>同行人甲</h3>
+            <label>起点站
+              <select id="m-origin-a"></select>
+            </label>
+            <label>最早出发
+              <input id="m-earliest-a" type="time" value="08:00" />
+            </label>
+          </div>
+          <div class="meet-person">
+            <h3>同行人乙</h3>
+            <label>起点站
+              <select id="m-origin-b"></select>
+            </label>
+            <label>最早出发
+              <input id="m-earliest-b" type="time" value="08:00" />
+            </label>
+          </div>
+          <label class="meet-dest">共同终点站
+            <select id="m-destination"></select>
+          </label>
+          <button id="btn-meet" type="button" class="primary">规划同车会合</button>
+        </div>
+      </div>
+
       <div class="card result-card">
         <h2>⑥ 规划结果</h2>
         <div id="result">

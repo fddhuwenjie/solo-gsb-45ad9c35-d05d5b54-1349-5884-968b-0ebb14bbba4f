@@ -5,6 +5,7 @@
 const EMPTY_DATA = { stations: [], trips: [], transfers: [], suspensions: [] };
 let data = structuredClone(EMPTY_DATA);
 let lastResult = null;
+let lastMode = "plan"; // "plan" | "meet"：当前结果区展示的是哪类规划
 let stale = false;
 let qid = 0;
 let continueReq = null; // 续程时回显的原 itinerary（来自最近一次规划/续程结果）
@@ -29,6 +30,12 @@ const els = {
   continuePref: $("#ct-preference"),
   continueError: $("#continue-error"),
   btnContinue: $("#btn-continue"),
+  meetOriginA: $("#m-origin-a"),
+  meetOriginB: $("#m-origin-b"),
+  meetDestination: $("#m-destination"),
+  meetEarliestA: $("#m-earliest-a"),
+  meetEarliestB: $("#m-earliest-b"),
+  btnMeet: $("#btn-meet"),
 };
 
 const esc = (s) =>
@@ -181,13 +188,28 @@ function renderAll() {
 function syncSelects() {
   const prevO = els.origin.value;
   const prevD = els.destination.value;
-  els.origin.innerHTML = stationOptions();
-  els.destination.innerHTML = stationOptions();
+  const opts = stationOptions();
+  els.origin.innerHTML = opts;
+  els.destination.innerHTML = opts;
+  els.meetOriginA.innerHTML = opts;
+  els.meetOriginB.innerHTML = opts;
+  els.meetDestination.innerHTML = opts;
   if ([...els.origin.options].some((o) => o.value === prevO)) els.origin.value = prevO;
   if ([...els.destination.options].some((o) => o.value === prevD)) els.destination.value = prevD;
   else if (data.stations.length)
     els.destination.value = data.stations[Math.min(1, data.stations.length - 1)].id;
   if (!els.origin.value && data.stations.length) els.origin.value = data.stations[0].id;
+  // 同车会合：甲默认第 1 个站、乙默认第 2 个站、终点默认与单人规划终点一致
+  if (!els.meetOriginA.value && data.stations.length)
+    els.meetOriginA.value = data.stations[0].id;
+  const prevB = els.meetOriginB.value;
+  if ([...els.meetOriginB.options].some((o) => o.value === prevB))
+    els.meetOriginB.value = prevB;
+  else if (data.stations.length > 1) els.meetOriginB.value = data.stations[1].id;
+  const prevMD = els.meetDestination.value;
+  if ([...els.meetDestination.options].some((o) => o.value === prevMD))
+    els.meetDestination.value = prevMD;
+  else els.meetDestination.value = els.destination.value;
 }
 
 // ---------------------------------------------------------------- 输入变更
@@ -354,11 +376,51 @@ async function runPlan() {
   }
   if (res.status === "error") return showError(res.message);
   lastResult = res;
+  lastMode = "plan";
   stale = false;
   els.recalc.hidden = true;
   continueReq = null;
   renderResult(res);
 }
+
+// ---------------------------------------------------------------- 两人同车会合
+async function runMeet() {
+  document.querySelectorAll(".row").forEach(readRow);
+
+  const body = {
+    data,
+    query: {
+      destination: els.meetDestination.value,
+      people: [
+        { origin: els.meetOriginA.value, earliest: els.meetEarliestA.value || "00:00",
+          label: "同行人甲" },
+        { origin: els.meetOriginB.value, earliest: els.meetEarliestB.value || "00:00",
+          label: "同行人乙" },
+      ],
+    },
+  };
+  els.result.innerHTML = `<p class="empty">搜索中…</p>`;
+  let res;
+  try {
+    const resp = await fetch("/api/meet", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    res = await resp.json();
+  } catch (err) {
+    return showError(`请求失败：${err.message}`);
+  }
+  if (res.status === "error") return showError(res.message);
+  lastResult = res;
+  lastMode = "meet";
+  stale = false;
+  els.recalc.hidden = true;
+  continueReq = null;
+  renderMeetResult(res);
+}
+
+els.btnMeet.addEventListener("click", runMeet);
 
 function showError(message) {
   els.result.innerHTML = `<p class="error-banner">⚠ ${esc(message)}</p>`;
@@ -495,6 +557,58 @@ function renderResult(res) {
   populateContinuePanel(it);
 }
 
+// ---------------------------------------------------------------- 同车会合结果
+function renderMeetResult(res) {
+  if (res.status === "blocked") {
+    els.continuePanel.hidden = true;
+    els.result.innerHTML = `
+      <div class="blocked">
+        <span class="badge">无法同车会合 · 原因说明</span>
+        <p>${esc(res.blocker.message)}</p>
+      </div>`;
+    return;
+  }
+
+  const m = res.meeting;
+  const chips = [
+    `<span class="chip ok">共同到达 <strong>${hhmm(m.arrival)}</strong></span>`,
+    `<span class="chip">会合站 <strong>${esc(sname(m.meeting_station))}</strong></span>
+     <span class="chip">共同班次 <strong>${esc(m.route)} / ${esc(m.trip_id)}</strong> · ${hhmm(m.meeting_departure)} 发车</span>`,
+    `<span class="chip">两人总步行 <strong>${m.walking_minutes}</strong> 分钟</span>`,
+    `<span class="chip">两人总候车 <strong>${m.waiting_minutes}</strong> 分钟</span>`,
+  ];
+  const peopleHtml = m.people
+    .map((pp) => {
+      const legsHtml = pp.legs.map((l, idx) => renderLegLi(l, idx, 0, "meet")).join("");
+      return `
+        <div class="meet-person-block meet-tag-${esc(pp.tag)}">
+          <h4>${esc(pp.label)}
+            <span class="hint">${esc(sname(pp.origin))} 不早于 ${hhmm(pp.earliest)} 出发
+              · ${hhmm(pp.arrive_meeting)} 到达会合站</span>
+          </h4>
+          <div class="meet-mini-chips">
+            <span class="chip">前段乘车 <strong>${pp.rides}</strong> 班</span>
+            <span class="chip">步行 <strong>${pp.walking_minutes}</strong> 分</span>
+            <span class="chip">候车 <strong>${pp.waiting_minutes}</strong> 分</span>
+          </div>
+          <ul class="timeline">${legsHtml}</ul>
+        </div>`;
+    })
+    .join("");
+  const sharedHtml = renderLegLi(m.shared_leg, 0, 0, "shared");
+
+  els.result.innerHTML = `
+    <div class="station-endpoint">
+      🤝 两人在 ${esc(sname(m.meeting_station))} 会合，同乘
+      ${esc(m.route)} 班次 ${esc(m.trip_id)} 直达 ${esc(sname(m.destination))}
+    </div>
+    <div class="summary">${chips.join("")}</div>
+    <div class="meet-people">${peopleHtml}</div>
+    <h4 class="meet-shared-title">同乘段（只计一次）</h4>
+    <ul class="timeline meet-shared">${sharedHtml}</ul>`;
+  els.continuePanel.hidden = true;
+}
+
 function renderSummaryChips(it, blocked) {
   const rideLegs = it.legs.filter((l) => l.type === "ride");
   const chips = [
@@ -510,21 +624,37 @@ function renderSummaryChips(it, blocked) {
   return `<div class="summary">${chips.join("")}</div>`;
 }
 
-function renderLegLi(l, idx, completedCount) {
-  // 续程时间线：前 completedCount 段为已完成部分，之后插入分隔标记
-  const done = !!l.completed;
-  const cls = ["leg", l.type, done ? "is-done" : "is-rest"].join(" ");
-  const badge = done
-    ? `<span class="done-flag">已完成</span>`
-    : `<span class="rest-flag">余程</span>`;
-  const divider =
-    renderDivider(idx, completedCount);
+function renderLegLi(l, idx, completedCount, mode = "continue") {
+  // mode: "continue"（单人/续程，带已完成/余程标记）、
+  //       "meet"（同车会合的两人前段，带会合标记）、
+  //       "shared"（两人同乘段，只展示一次）
+  const cls = ["leg", l.type];
+  let badge = "";
+  let divider = "";
+  if (mode === "continue") {
+    // 续程时间线：前 completedCount 段为已完成部分，之后插入分隔标记
+    const done = !!l.completed;
+    cls.push(done ? "is-done" : "is-rest");
+    badge = done
+      ? `<span class="done-flag">已完成</span>`
+      : `<span class="rest-flag">余程</span>`;
+    divider = renderDivider(idx, completedCount);
+  } else if (mode === "meet") {
+    cls.push("is-meet");
+    badge = `<span class="meet-flag">会合前段</span>`;
+  } else if (mode === "shared") {
+    cls.push("is-shared");
+    badge = `<span class="shared-flag">两人同乘</span>`;
+  }
   let body;
   if (l.type === "wait") {
+    const waitNote = mode === "meet"
+      ? "候车（等待共同班次，计入本人）"
+      : "站内候车";
     body = `
       <span class="dot">等</span>
       <div class="when">${hhmm(l.start)} – ${hhmm(l.end)}（${l.minutes} 分钟）</div>
-      <div class="what">站内候车 ${badge}</div>
+      <div class="what">${waitNote} ${badge}</div>
       <div class="meta">在 ${esc(sname(l.station))} 等待下一班</div>`;
   } else if (l.type === "walk") {
     body = `
@@ -533,14 +663,17 @@ function renderLegLi(l, idx, completedCount) {
       <div class="what">步行换乘：${esc(sname(l.from))} → ${esc(sname(l.to))} ${badge}</div>
       <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>`;
   } else {
+    const rideNote = mode === "shared"
+      ? `${esc(l.route)} · 班次 ${esc(l.trip_id)}（会合后同乘直达）`
+      : `${esc(l.route)} · 班次 ${esc(l.trip_id)}`;
     body = `
       <span class="dot">乘</span>
       <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
-      <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)} ${badge}</div>
+      <div class="what">${rideNote} ${badge}</div>
       <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
       ${l.truncated ? `<div class="meta trunc">⚠ ${esc(l.truncation)}</div>` : ""}`;
   }
-  return `${divider}<li class="${cls}" data-leg-index="${idx}">${body}</li>`;
+  return `${divider}<li class="${cls.join(" ")}" data-leg-index="${idx}">${body}</li>`;
 }
 
 function renderDivider(idx, completedCount) {
@@ -559,7 +692,13 @@ async function loadSample() {
   renderAll();
   els.earliest.value = "08:00";
   els.preference.value = "fastest";
-  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」。</p>`;
+  // 同车会合示例：S2 与 S4 各自 08:00 出发，在 S4 会合同乘 K2 到 S6
+  els.meetOriginA.value = "S2";
+  els.meetOriginB.value = "S4";
+  els.meetDestination.value = "S6";
+  els.meetEarliestA.value = "08:00";
+  els.meetEarliestB.value = "08:00";
+  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」或「规划同车会合」。</p>`;
   els.continuePanel.hidden = true;
   els.recalc.hidden = true;
 }
@@ -614,6 +753,10 @@ $("#btn-export").addEventListener("click", exportJson);
 $("#btn-import").addEventListener("click", () => els.fileImport.click());
 $("#btn-plan").addEventListener("click", runPlan);
 [els.origin, els.destination, els.earliest, els.preference].forEach((el) =>
+  el.addEventListener("change", markStale)
+);
+[els.meetOriginA, els.meetOriginB, els.meetDestination,
+ els.meetEarliestA, els.meetEarliestB].forEach((el) =>
   el.addEventListener("change", markStale)
 );
 

@@ -3,7 +3,8 @@
 基于 **Python Flask + 原生 JavaScript / HTML / CSS** 的公交时刻换乘规划工具。
 用户录入站点、带发车时刻的线路班次、站内（站间）步行换乘时间与临时停运区间，
 选择起终点、最早出发时刻和「最快 / 少换乘 / 少步行」偏好，系统在**时间依赖图**上
-搜索可行行程，并逐段展示班次、等待与换乘细节。
+搜索可行行程，并逐段展示班次、等待与换乘细节；另支持**两人同车会合**规划：
+两人先到同一会合站赶上同一班次，再同乘该班次直达共同终点。
 
 ## 一条命令启动
 
@@ -45,7 +46,9 @@ python app.py
      不受影响（例如可在区段终点之后重新上车，甚至步行绕过封锁后
      在更靠后的经停站重新登上同一班次）。
 
-在「⑤ 行程规划」中选择起点、终点、最早出发时刻与偏好后点击 **规划行程**。
+在「⑤ 行程规划」中选择起点、终点、最早出发时刻与偏好后点击 **规划行程**；
+在「🤝 两人同车会合」中填写两人起点、各自最早出发时刻与共同终点后点击
+**规划同车会合**。
 **修改任何输入后可再次点击直接重算**，页面会提示“结果待重算”。
 工具栏支持载入示例、清空、导入 / 导出 JSON。
 
@@ -75,6 +78,31 @@ python app.py
 
 续程结果本身也可再次作为原行程继续续程；重新点击「规划行程」则按当前
 网络从头规划。
+
+### 两人同车会合（🤝）
+
+右栏「🤝 两人同车会合」面板分别填写**同行人甲、同行人乙**的起点站与最早出发
+时刻，以及两人的**共同终点站**，点击 **规划同车会合**。搜索的行程形态固定为：
+
+1. 两人各走自己的前段（乘车 / 步行，逐段遵守步行换乘时间、站点停运、
+   整线停运与区段封锁），先到**同一个会合站**；
+2. 两人在会合站赶上**同一班次**；
+3. 由该班次**直达**共同终点（同乘段在结果中只展示一次）。
+
+结果区并排展示两人会合前各自的乘车、步行与候车时间线，最后单列同乘段；
+等待共同班次发车的那段候车**分别计入两人**的候车统计。
+
+取解字典序（从主到次）：
+
+> **共同到达时刻 → 两人总步行分钟 → 两人总候车分钟 → 共同班次 ID → 会合站 ID**
+
+固定某趟共同班次及其发车时刻后，每个人的前段独立按
+「本人总步行 → 本人总候车（含等待该班次）」挑选。因此**较晚到会合站、
+但步行更少且仍赶得上同一班次的前段，会胜过本人最快到达的前段**。
+
+找不到双方都赶得上的共同班次时，状态为 `blocked`，原因会具体指出谁无法
+到达会合站（含其前段搜索中时间最早的阻塞约束）或谁差多少分钟赶不上车；
+**任何一方单独到达终点的路线都不计为同行**。
 
 ### 偏好与字典序取解
 
@@ -108,8 +136,9 @@ python app.py
 
 - `GET /` — 页面
 - `GET /api/sample` — 内置示例数据
-- `POST /api/plan` — 规划
+- `POST /api/plan` — 单人规划
 - `POST /api/continue` — 行程途中停运 / 班次调整后的续程
+- `POST /api/meet` — 两人同车会合规划
 
 `/api/plan` 请求体：
 
@@ -292,16 +321,131 @@ curl -X POST http://localhost:8000/api/continue \
 常见 400 错误：完成段下标越界 / 指向候车段、当前时刻早于最后到达时刻、
 完成前缀站点或时间不连续、完成段引用了更新后网络中不存在的站点。
 
+### `/api/meet` 两人同车会合接口
+
+请求体：
+
+```json
+{
+  "query": {
+    "destination": "S6",
+    "people": [
+      {"origin": "S2", "earliest": "08:00", "label": "同行人甲"},
+      {"origin": "S4", "earliest": "08:00", "label": "同行人乙"}
+    ]
+  },
+  "data": { ... }
+}
+```
+
+- `destination`：两人的共同终点站；
+- `people`：**恰好两人**，各自 `origin`（起点站）与 `earliest`（最早出发
+  时刻，缺省 `00:00`），`label` 可选（缺省「同行人甲 / 同行人乙」，会出现在
+  时间线与阻塞消息中）。
+- 也支持平铺写法（顶层或 `query` 内）：`origin1` / `earliest1`（或
+  `origin_a` / `earliest_a`）、`origin2` / `earliest2` 与 `destination`。
+
+成功返回 `{"status": "ok", "meeting": {...}}`，其中 `meeting` 结构：
+
+- `meeting_station` / `trip_id` / `route` / `meeting_departure` /
+  `arrival`：会合站、共同班次、共同班次在会合站的发车时刻与共同到达时刻；
+- `people[2]`：各自的前段结果，含 `origin` / `earliest` /
+  `arrive_meeting`（到会合站时刻）、`rides` / `transfers` /
+  `walking_minutes` / `waiting_minutes` 与 `legs` 时间线。各人 `legs`
+  一直排到共同班次发车，因此**等待共同班次的候车段在两人时间线中各出现
+  一次**；区段封锁导致的前段截断乘车段照常带 `truncated` 标注；
+- `shared_leg`：会合后的同乘段（`meet_station → destination`，
+  带 `"shared": true`），**只出现一次**，不计入任何一人的前段；
+- 顶层 `walking_minutes` / `waiting_minutes` 为**两人合计**，
+  `rides` 为两人前段班次数加同乘段一趟。
+
+无解时：
+
+- `{"status": "blocked", "blocker": {"kind": "cannot_meet", ...}}` —
+  不存在双方都赶得上的共同班次，消息会列出各自动态（无法到达会合站时
+  附带其前段搜索中时间最早的阻塞约束），并明确说明单独到达不计为同行；
+- `kind: "no_shared_service"` — 没有任何班次能在当前停运约束下直达
+  共同终点；
+- `kind: "origin_closed"`（带 `person`: `A`/`B`）— 某人起点站在其最早
+  出发时刻即处于停运时段。
+
+输入不合法（人数不为 2、缺少起点 / 终点、站点或时刻非法等）返回 HTTP 400。
+
+#### 同车会合调用示例
+
+以内置示例数据（`GET /api/sample`）为例：甲从 S2（东郊路）、乙从 S4
+（人民广场）各自不早于 08:00 出发，共同终点 S6（火车北站）。甲步行 4
+分钟到 S1 乘 K2 并于 08:25 到达 S4，乙自 08:00 起在 S4 候车；两人
+08:25 在 S4 会合同乘 K2 于 08:35 直达 S6（甲到会合站即发车，不再产生
+候车段）：
+
+```bash
+curl -X POST http://localhost:8000/api/meet \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": {
+      "destination": "S6",
+      "people": [
+        {"origin": "S2", "earliest": "08:00", "label": "同行人甲"},
+        {"origin": "S4", "earliest": "08:00", "label": "同行人乙"}
+      ]
+    },
+    "data": <内置示例 /api/sample 的 JSON>
+  }'
+```
+
+响应（节选）：
+
+```json
+{"status": "ok", "meeting": {
+  "meeting_station": "S4", "trip_id": "K2", "route": "2路",
+  "meeting_departure": 505, "arrival": 515,
+  "walking_minutes": 4, "waiting_minutes": 29,
+  "people": [
+    {"tag": "A", "label": "同行人甲", "origin": "S2", "earliest": 480,
+     "arrive_meeting": 505, "rides": 1, "walking_minutes": 4,
+     "waiting_minutes": 4, "legs": [
+       {"type": "walk", "from": "S2", "to": "S1",
+        "depart": 480, "arrive": 484, "minutes": 4},
+       {"type": "wait", "station": "S1", "start": 484, "end": 488,
+        "minutes": 4},
+       {"type": "ride", "trip_id": "K2", "route": "2路",
+        "from": "S1", "to": "S4", "depart": 488, "arrive": 505,
+        "minutes": 17}]},
+    {"tag": "B", "label": "同行人乙", "origin": "S4", "earliest": 480,
+     "arrive_meeting": 480, "rides": 0, "walking_minutes": 0,
+     "waiting_minutes": 25, "legs": [
+       {"type": "wait", "station": "S4", "start": 480, "end": 505,
+        "minutes": 25}]}
+  ],
+  "shared_leg": {"type": "ride", "trip_id": "K2", "route": "2路",
+                 "from": "S4", "to": "S6", "depart": 505, "arrive": 515,
+                 "minutes": 10, "shared": true}}}
+```
+
+其中 `waiting_minutes` 合计 29 = 甲前段候车 4 分钟（S1 等 K2）+ 乙
+候车 25 分钟（在 S4 等共同班次）；各人到会合站后等待共同班次的时间分别
+计入本人。若双方无法赶上任何同一班次，例如：
+
+```json
+{"status": "blocked", "blocker": {
+  "kind": "cannot_meet", "trip_id": "K2", "station": "S4", "time": 505,
+  "message": "两人无法乘上同一班次同车到达 火车北站：同行人甲最早于 09:12 才到 人民广场，赶不上班次 K2（2路）08:25 的发车（晚 47 分钟）。（任一方单独到达终点的路线均不计为同行。）"}}
+```
+
 ## 目录结构
 
 ```
 .
-├── app.py               # Flask 路由与静态页面
-├── planner.py           # 时间依赖图、停运判定、多标签搜索、阻塞约束归因
+├── app.py               # Flask 路由与静态页面（/api/plan、/api/continue、/api/meet）
+├── planner.py           # 时间依赖图、停运判定、多标签搜索、阻塞约束归因、同车会合
 ├── static/
 │   ├── index.html       # 页面结构
 │   ├── style.css        # 样式
-│   └── app.js           # 原生 JS：录入、重算、结果渲染
+│   └── app.js           # 原生 JS：录入、重算、单人/续程/同车会合结果渲染
+├── test_segment.py      # 区段停运行为验证
+├── test_continue.py     # 行程续程行为验证
+├── test_meet.py         # 两人同车会合行为验证
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml

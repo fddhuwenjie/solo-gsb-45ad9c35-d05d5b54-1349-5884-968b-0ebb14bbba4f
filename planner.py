@@ -427,16 +427,24 @@ class Planner:
                                              result["rides"], result["walk"],
                                              result["arrival"])}
 
-    def _search_core(self, origin: str, destination: str, earliest: int,
+    def _search_core(self, origin: str, destination: str | None, earliest: int,
                      preference: str, initial_ridden: frozenset,
                      start_noun: str, start_action: str,
-                     start_window_action: str) -> dict:
+                     start_window_action: str, mode: str = "plan") -> dict:
         """从 (origin, earliest) 出发的多标签时间依赖搜索。
 
         initial_ridden 为已乘过的 (班次ID, 站段下标) 集合：余程中同一班次
         不得再经过这些站段（续程绕行后重乘同一班次时尤为关键）。
-        成功返回 {"status": "ok", "chain", "rides", "walk", "arrival",
-        "explored", "blockers"}；起点停运立即返回 blocked。
+
+        mode 有两种：
+        - "plan"：常规规划 / 续程余程。destination 必填，标签按所选偏好的
+          三元组（到达时刻、换乘次数、总步行）互相支配，成功时只返回终点最优
+          标签的链；
+        - "meet"：两人同车会合的前段搜索（目的地在搜索时未知）。标签记录
+          (到达时刻、总步行、已候车分钟) 并按此三元组互相支配，返回每个站点
+          的完整帕累托标签面，供会合算法对不同共同班次发车时刻挑前段。
+        成功返回 {"status": "ok", ..., "explored", "blockers"}；起点停运立即
+        返回 blocked。
         """
         # 出发站在出发时刻即停运：任何方案都不可能成立
         open_at_start, window = self.station_open(origin, earliest)
@@ -453,9 +461,10 @@ class Planner:
                 ),
             })
 
-        if origin == destination:
+        if mode == "plan" and origin == destination:
             return {"status": "ok", "chain": (), "rides": 0, "walk": 0,
-                    "arrival": earliest, "explored": 0, "blockers": {}}
+                    "wait": 0, "arrival": earliest, "explored": 0,
+                    "blockers": {}}
 
         blockers: dict[tuple, dict] = {}
 
@@ -472,8 +481,11 @@ class Planner:
                 "arrival": label["arrival"],
                 "transfers": max(0, label["rides"] - 1),
                 "walking": label["walk"],
+                "waiting": label["wait"],
             }
-            return tuple(values[f] for f in order)
+            fields = ("arrival", "walking", "waiting") if mode == "meet" \
+                else order
+            return tuple(values[f] for f in fields)
 
         def dominates(a: dict, b: dict) -> bool:
             va, vb = list(vec(a)), list(vec(b))
@@ -486,10 +498,11 @@ class Planner:
         def key_tuple(label: dict) -> tuple:
             return tuple(vec(label)) + (label["ridden"],)
 
-        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、已乘站段集合、链
+        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、累计候车分钟、
+        # 已乘站段集合、链
         start_label = {
             "uid": 0, "station": origin, "arrival": earliest,
-            "rides": 0, "walk": 0, "ridden": frozenset(initial_ridden),
+            "rides": 0, "walk": 0, "wait": 0, "ridden": frozenset(initial_ridden),
             "chain": (),
         }
         buckets: dict[str, list[dict]] = {s: [] for s in self.n["stations"]}
@@ -502,10 +515,11 @@ class Planner:
         explored = 0
 
         def try_extend(label: dict, station: str, arrival: int, rides: int,
-                       walk: int, ridden: frozenset, step: dict) -> None:
+                       walk: int, wait: int, ridden: frozenset,
+                       step: dict) -> None:
             new_label = {
                 "uid": next(counter), "station": station, "arrival": arrival,
-                "rides": rides, "walk": walk, "ridden": ridden,
+                "rides": rides, "walk": walk, "wait": wait, "ridden": ridden,
                 "chain": label["chain"] + (step,),
             }
             bucket = buckets[station]
@@ -545,7 +559,8 @@ class Planner:
                     })
                     continue
                 try_extend(label, neighbor, arrival, label["rides"],
-                           label["walk"] + minutes, label["ridden"],
+                           label["walk"] + minutes, label["wait"],
+                           label["ridden"],
                            {"type": "walk", "from": station, "to": neighbor,
                             "depart": ready, "arrive": arrival,
                             "minutes": minutes})
@@ -647,13 +662,18 @@ class Planner:
                     new_segments.add(j - 1)
                     try_extend(
                         label, target, arrive_at, label["rides"] + 1,
-                        label["walk"],
+                        label["walk"], label["wait"] + dep - ready,
                         label["ridden"] | frozenset(
                             (trip_id, s) for s in new_segments),
                         {"type": "ride", "trip_id": trip_id,
                          "route": trip["route"], "from": station,
                          "to": target, "depart": dep, "arrive": arrive_at,
                          "minutes": arrive_at - dep})
+
+        # 会合前段搜索：返回每个站点的完整帕累托标签面（不再只取终点最优）
+        if mode == "meet":
+            return {"status": "ok", "buckets": buckets, "explored": explored,
+                    "blockers": blockers}
 
         candidates = buckets[destination]
         if not candidates:
@@ -670,7 +690,8 @@ class Planner:
                     "walking": lb["walk"]}[f] for f in order]),
             lb["uid"]))
         return {"status": "ok", "chain": best["chain"], "rides": best["rides"],
-                "walk": best["walk"], "arrival": best["arrival"],
+                "walk": best["walk"], "wait": best["wait"],
+                "arrival": best["arrival"],
                 "explored": explored, "blockers": blockers}
 
     # ------------------------------------------------------------------ #
@@ -750,13 +771,15 @@ class Planner:
             f"{self.sname(leg['to'])} 终止，需步行或换乘其他班次继续。")
 
     # ------------------------------------------------------------------ #
-    def _itinerary(self, origin: str, destination: str, earliest: int,
-                   preference: str, chain: tuple, rides: int,
-                   walk: int = 0, arrival: int | None = None) -> dict:
+    def _chain_legs(self, chain: tuple, earliest: int) -> tuple[list[dict], int]:
+        """把搜索链（ride/walk 步骤）展开为含候车段的时间线。
+
+        候车段在每个步骤前按步骤出发时刻与当前光标的差自动补出。
+        返回 (legs, 候车分钟)；乘车段若恰在区段封锁起点终止则补截断说明。
+        """
         legs: list[dict] = []
         cursor = earliest
         total_wait = 0
-        total_walk = 0
         for step in chain:
             if step["depart"] > cursor:
                 wait = step["depart"] - cursor
@@ -771,11 +794,17 @@ class Planner:
                     leg["truncated"] = True
                     leg["truncation"] = note
             legs.append(leg)
-            if step["type"] == "walk":
-                total_walk += step["minutes"]
             cursor = step["arrive"]
+        return legs, total_wait
+
+    def _itinerary(self, origin: str, destination: str, earliest: int,
+                   preference: str, chain: tuple, rides: int,
+                   walk: int = 0, arrival: int | None = None) -> dict:
+        legs, total_wait = self._chain_legs(chain, earliest)
+        total_walk = sum(
+            step["minutes"] for step in chain if step["type"] == "walk")
         if arrival is None:
-            arrival = cursor
+            arrival = legs[-1]["arrive"] if legs else earliest
         return {
             "origin": origin,
             "destination": destination,
@@ -788,6 +817,285 @@ class Planner:
             "walking_minutes": walk or total_walk,
             "waiting_minutes": total_wait,
             "legs": legs,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 两人同车会合：各自前段 → 同一会合站同一班次 → 直达共同终点
+    # ------------------------------------------------------------------ #
+    def plan_meeting(self, people: list[dict], destination: str) -> dict:
+        """为两人规划同车会合行程。
+
+        people 为两人各自的 {"origin", "earliest", "label"}；两人先分别走自己
+        的前段（乘车 / 步行，遵守步行换乘、站点停运、整线停运与区段封锁），在
+        同一会合站赶上同一班次，再由该班次直达共同终点。等待共同班次发车的
+        候车分别计入两人。
+
+        取解字典序：共同到达时刻 → 两人总步行 → 两人总候车 → 共同班次 ID →
+        会合站 ID。固定共同班次的发车时刻后，每个人的前段按「总步行 →
+        自己的总候车（含等该班次）→ 标签产生先后」挑选，因此较晚到会合站
+        但步行更少且仍赶得上同一班次的前段会胜过自己的最快前段。
+        """
+        if destination not in self.names:
+            raise PlanError(f"终点站不存在：{destination}")
+        if not isinstance(people, list) or len(people) != 2:
+            raise PlanError("同车会合需要恰好两人的起点与最早出发时刻")
+
+        persons: list[dict] = []
+        for k, item in enumerate(people):
+            if not isinstance(item, dict):
+                raise PlanError(f"第 {k + 1} 人的信息格式不合法")
+            origin = str(item.get("origin", "")).strip()
+            if not origin:
+                raise PlanError(f"第 {k + 1} 人缺少起点站")
+            if origin not in self.names:
+                raise PlanError(f"第 {k + 1} 人起点站不存在：{origin}")
+            earliest = parse_time(item.get("earliest", "00:00"),
+                                  f"第 {k + 1} 人最早出发时刻")
+            label = str(item.get("label") or "").strip()
+            if not label:
+                label = "同行人甲" if k == 0 else "同行人乙"
+            persons.append({"origin": origin, "earliest": earliest,
+                            "label": label, "tag": "A" if k == 0 else "B"})
+
+        # ---- 两人各自的前段帕累托标签面（到达时刻 / 步行 / 候车）----
+        searches: list[dict] = []
+        for person in persons:
+            search = self._search_core(
+                person["origin"], None, person["earliest"], "fastest",
+                frozenset(),
+                start_noun=f"{person['label']}的起点站",
+                start_action="meet", start_window_action="出发会合",
+                mode="meet")
+            if search["status"] == "blocked":
+                blocker = dict(search["blocker"])
+                blocker["person"] = person["tag"]
+                blocker["person_label"] = person["label"]
+                blocker["message"] = (
+                    f"{person['label']}无法出发：{blocker['message']}")
+                return {"status": "blocked", "blocker": blocker}
+            searches.append(search)
+
+        ride_candidates: list[dict] = []
+
+        # ---- 枚举所有「某班次从某经停站直达终点」的同乘候选 ----
+        for tid in self.n["trip_order"]:
+            trip = self.n["trips"][tid]
+            stops = trip["stops"]
+            dest_indices = [j for j, st in enumerate(stops)
+                            if st["station"] == destination]
+            if not dest_indices:
+                continue
+            for board_idx in range(len(stops) - 1):
+                dest_idx = next((j for j in dest_indices if j > board_idx), None)
+                if dest_idx is None:
+                    continue
+                problem = self._shared_ride_blocker(
+                    trip, board_idx, dest_idx)
+                if problem is not None:
+                    continue  # 该同乘段本身违反停运 / 封锁约束，跳过
+                ride_candidates.append({
+                    "trip_id": tid, "route": trip["route"],
+                    "board_idx": board_idx, "dest_idx": dest_idx,
+                    "station": stops[board_idx]["station"],
+                    "dep": stops[board_idx]["time"],
+                    "arrival": stops[dest_idx]["time"],
+                })
+
+        if not ride_candidates:
+            return {"status": "blocked", "blocker": {
+                "kind": "no_shared_service", "action": "meet",
+                "station": destination, "time": 0, "trip_id": None,
+                "message": (
+                    f"没有任何班次能在遵守站点停运、整线停运与区段封锁的前提下"
+                    f"直达共同终点 {self.sname(destination)}，两人无法同车会合。"
+                ),
+            }}
+
+        joint_ok: list[dict] = []
+        near_misses: list[dict] = []
+        for cand in ride_candidates:
+            choices: list[dict | None] = []
+            for person, search in zip(persons, searches):
+                labels = search["buckets"].get(cand["station"], ())
+                catchable = [lb for lb in labels
+                             if lb["arrival"] <= cand["dep"]]
+                if catchable:
+                    best = min(catchable, key=lambda lb: (
+                        lb["walk"],
+                        lb["wait"] + cand["dep"] - lb["arrival"],
+                        lb["uid"]))
+                    choices.append({"label": best, "catch": True})
+                elif labels:
+                    # 能到会合站，但最近的标签也赶不上这一班
+                    soonest = min(labels, key=lambda lb: (lb["arrival"],
+                                                          lb["uid"]))
+                    choices.append({"label": soonest, "catch": False,
+                                    "miss": soonest["arrival"] - cand["dep"]})
+                else:
+                    choices.append(None)
+            if all(c is not None and c["catch"] for c in choices):
+                total_walk = sum(c["label"]["walk"] for c in choices)
+                total_wait = sum(c["label"]["wait"] + cand["dep"]
+                                 - c["label"]["arrival"] for c in choices)
+                joint_ok.append({
+                    "cand": cand, "choices": choices,
+                    "total_walk": total_walk, "total_wait": total_wait,
+                })
+            else:
+                miss = sum(c["miss"] for c in choices if c is not None
+                           and not c["catch"])
+                unreachable = sum(1 for c in choices if c is None)
+                near_misses.append({
+                    "cand": cand, "choices": choices,
+                    "miss": miss, "unreachable": unreachable,
+                })
+
+        if not joint_ok:
+            return self._meeting_blocked(persons, searches, destination,
+                                         ride_candidates, near_misses)
+
+        best = min(joint_ok, key=lambda x: (
+            x["cand"]["arrival"], x["total_walk"], x["total_wait"],
+            x["cand"]["trip_id"], x["cand"]["station"]))
+        return {"status": "ok",
+                "meeting": self._meeting_result(
+                    persons, destination, best["cand"], best["choices"],
+                    best["total_walk"], best["total_wait"])}
+
+    def _shared_ride_blocker(self, trip: dict, board_idx: int,
+                             dest_idx: int) -> dict | None:
+        """检查「同乘班次 trip 从 board_idx 站直达 dest_idx 站」这一段是否
+        违反停运约束：上车站须开放上车、中间封锁站段不可穿越、途经封站只能
+        跳站通过、终点站须开放下车、整线在上车站发车时刻须未停运。
+        任一不满足返回阻塞事件（仅用于跳过该候选，不做最终归因）。"""
+        board = trip["stops"][board_idx]["station"]
+        dep = trip["stops"][board_idx]["time"]
+        open_board, win_board = self.station_open(board, dep)
+        if not open_board:
+            return {"kind": "station_closed", "action": "board",
+                    "station": board, "time": dep}
+        open_route, win_route = self.route_open(trip["route"], dep)
+        if not open_route:
+            return {"kind": "route_suspended", "action": "board",
+                    "station": board, "time": dep, "window": win_route}
+        for j in range(board_idx + 1, dest_idx + 1):
+            closure = self.segment_closure(trip["id"], j - 1)
+            if closure is not None:
+                return {"kind": "segment_suspended", "action": "ride",
+                        "station": trip["stops"][j - 1]["station"],
+                        "time": trip["stops"][j - 1]["time"]}
+            target = trip["stops"][j]["station"]
+            arrive_at = trip["stops"][j]["time"]
+            open_now, win = self.station_open(target, arrive_at)
+            if not open_now:
+                if j == dest_idx:
+                    return {"kind": "station_closed", "action": "alight",
+                            "station": target, "time": arrive_at}
+                # 途经封站：该班次跳站通过，仍可乘到终点，不构成阻塞
+                continue
+        return None
+
+    def _meeting_blocked(self, persons: list[dict], searches: list[dict],
+                         destination: str, ride_candidates: list[dict],
+                         near_misses: list[dict]) -> dict:
+        """不存在双方都赶得上的共同班次时的归因：只在同乘候选范围内挑选
+        最有希望的一个说明原因，绝不把任何一方单独到达终点的路线当同行。"""
+        # 优先报告「两人都能到会合站、只差一点赶上车」的候选
+        rep = min(near_misses, key=lambda x: (
+            x["unreachable"], x["miss"], x["cand"]["arrival"],
+            x["cand"]["trip_id"], x["cand"]["station"]))
+        cand = rep["cand"]
+        parts: list[str] = []
+        for person, search, choice in zip(persons, searches,
+                                          rep["choices"]):
+            if choice is None:
+                detail = self._person_blocker_text(
+                    person, search, cand["station"])
+                parts.append(
+                    f"{person['label']}无法到达会合站 {self.sname(cand['station'])}"
+                    f"（{detail}）")
+            elif not choice["catch"]:
+                parts.append(
+                    f"{person['label']}最早于 {to_hhmm(choice['label']['arrival'])} "
+                    f"才到 {self.sname(cand['station'])}，赶不上班次 "
+                    f"{cand['trip_id']}（{cand['route']}）"
+                    f"{to_hhmm(cand['dep'])} 的发车（晚 {choice['miss']} 分钟）")
+        blocker = {
+            "kind": "cannot_meet", "action": "meet",
+            "station": cand["station"], "time": cand["dep"],
+            "trip_id": cand["trip_id"], "destination": destination,
+            "message": (
+                f"两人无法乘上同一班次同车到达 {self.sname(destination)}："
+                + "；".join(parts)
+                + "。（任一方单独到达终点的路线均不计为同行。）"),
+        }
+        return {"status": "blocked", "blocker": blocker}
+
+    def _person_blocker_text(self, person: dict, search: dict,
+                             target: str) -> str:
+        """某人无法到达会合站时，取其前段搜索中时间最早的阻塞原因。"""
+        items = list(search["blockers"].values())
+        if items:
+            kind_rank = {"origin_closed": 0, "station_closed": 1,
+                         "segment_suspended": 2, "route_suspended": 3,
+                         "no_service_after": 4}
+            first = min(items, key=lambda b: (
+                b.get("time", 0), str(b.get("station", "")),
+                str(b.get("trip_id", "")), kind_rank.get(b["kind"], 9)))
+            return first["message"]
+        return (f"{person['origin']} 与 {target} 之间不存在连通路径，"
+                "且搜索中未遇到更具体的停运约束")
+
+    def _meeting_result(self, persons: list[dict], destination: str,
+                        cand: dict, choices: list[dict],
+                        total_walk: int, total_wait: int) -> dict:
+        """拼装同车会合结果：各自前段时间线（含等待共同班次）+ 只展示一次的
+        同乘段。"""
+        trip_id = cand["trip_id"]
+        route = cand["route"]
+        meet_station = cand["station"]
+        dep = cand["dep"]
+        arrival = cand["arrival"]
+
+        people_out: list[dict] = []
+        for person, choice in zip(persons, choices):
+            label = choice["label"]
+            legs, front_wait = self._chain_legs(label["chain"],
+                                                person["earliest"])
+            own_wait = label["wait"] + dep - label["arrival"]
+            if dep > label["arrival"]:
+                legs.append({"type": "wait", "station": meet_station,
+                             "start": label["arrival"], "end": dep,
+                             "minutes": dep - label["arrival"]})
+            rides = label["rides"]
+            people_out.append({
+                "tag": person["tag"], "label": person["label"],
+                "origin": person["origin"], "earliest": person["earliest"],
+                "arrive_meeting": label["arrival"],
+                "rides": rides, "transfers": max(0, rides - 1),
+                "walking_minutes": label["walk"],
+                "waiting_minutes": own_wait,
+                "legs": legs,
+            })
+
+        shared_leg = {"type": "ride", "trip_id": trip_id, "route": route,
+                      "from": meet_station, "to": destination,
+                      "depart": dep, "arrive": arrival,
+                      "minutes": arrival - dep, "shared": True}
+
+        return {
+            "destination": destination,
+            "meeting_station": meet_station,
+            "trip_id": trip_id,
+            "route": route,
+            "meeting_departure": dep,
+            "arrival": arrival,
+            "rides": sum(p["rides"] for p in people_out) + 1,
+            "transfers": sum(p["transfers"] for p in people_out),
+            "walking_minutes": total_walk,
+            "waiting_minutes": total_wait,
+            "people": people_out,
+            "shared_leg": shared_leg,
         }
 
     # ------------------------------------------------------------------ #
