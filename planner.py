@@ -18,6 +18,12 @@
 已走事实）；自该段到达站与用户填写的当前时刻起，在更新后的网络上搜索余程，累计整程
 换乘、步行与候车（含完成段至当前时刻的等待）。余程搜索中同一班次不得再经过已乘过的
 站段；接续无解时返回完成部分（含等待至当前时刻）与余程的首个阻塞约束。
+
+两人同车会合（meet）：各自从起点与最早出发时刻出发，先到同一会合站、赶上同一班次，
+再同乘该班次直达共同终点。对每一（会合站, 共同班次）候选，两人各取「仍赶得上该班次」
+的前段中步行最少、并列时候车最少的一段（等共同班次的候车分别计入两人）；整解按
+共同到达时刻 → 两人总步行 → 两人总候车 → 班次 ID → 会合站 ID 字典序取解。
+找不到双方都赶得上的共同班次时返回未能同行的原因，不把任一方单独到达的路线当作同行。
 """
 
 from __future__ import annotations
@@ -408,6 +414,93 @@ class Planner:
             base += f"（{window['label']}）"
         return base
 
+    # ------------------------------------------------------------------ #
+    # 阻塞约束构造（_search_core 与会合前段搜索共用，消息格式保持一致）
+    # ------------------------------------------------------------------ #
+    def _blk_walk_closed(self, station: str, neighbor: str, arrival: int,
+                         win: dict | None) -> dict:
+        return {
+            "kind": "station_closed", "action": "walk",
+            "station": neighbor, "time": arrival,
+            "trip_id": None, "window": win,
+            "message": (
+                f"步行 {self.sname(station)}→{self.sname(neighbor)} 于 "
+                f"{to_hhmm(arrival)} 到达 {self.sname(neighbor)}，但该站处于"
+                f"临时停运时段{self._window_text(win)}，无法进入换乘。"
+            ),
+        }
+
+    def _blk_board_closed(self, station: str, dep: int, trip: dict,
+                          win: dict | None) -> dict:
+        return {
+            "kind": "station_closed", "action": "board",
+            "station": station, "time": dep,
+            "trip_id": trip["id"], "window": win,
+            "message": (
+                f"拟于 {to_hhmm(dep)} 在 {self.sname(station)} 乘坐班次 "
+                f"{trip['id']}（{trip['route']}），但该站此时处于临时停运时段"
+                f"{self._window_text(win)}，不能上车。"
+            ),
+        }
+
+    def _blk_route_suspended(self, station: str, dep: int, trip: dict,
+                             win: dict | None) -> dict:
+        return {
+            "kind": "route_suspended", "action": "board",
+            "station": station, "time": dep,
+            "trip_id": trip["id"], "window": win,
+            "route": trip["route"],
+            "message": (
+                f"班次 {trip['id']}（{trip['route']}）原定于 {to_hhmm(dep)} 从 "
+                f"{self.sname(station)} 发车，但线路在临时停运区间"
+                f"{self._window_text(win)}内，该班次被跳过。"
+            ),
+        }
+
+    def _blk_segment_suspended(self, trip: dict, seg_idx: int,
+                               closure: dict) -> dict:
+        seg_from = trip["stops"][seg_idx]["station"]
+        seg_to = trip["stops"][seg_idx + 1]["station"]
+        detail = (
+            f"{trip['route']} {self.sname(closure['from'])}→"
+            f"{self.sname(closure['to'])} "
+            f"{to_hhmm(closure['start'])}–"
+            f"{to_hhmm(closure['end'])}")
+        if closure["label"]:
+            detail += f"，{closure['label']}"
+        return {
+            "kind": "segment_suspended", "action": "ride",
+            "station": seg_from,
+            "time": trip["stops"][seg_idx]["time"],
+            "trip_id": trip["id"], "route": trip["route"],
+            "seg_from": seg_from, "seg_to": seg_to,
+            "window": {"start": closure["start"],
+                       "end": closure["end"],
+                       "label": closure["label"]},
+            "message": (
+                f"班次 {trip['id']}（{trip['route']}）于 "
+                f"{to_hhmm(trip['stops'][seg_idx]['time'])} 到达 "
+                f"{self.sname(seg_from)} 后，前方 "
+                f"{self.sname(seg_from)}→{self.sname(seg_to)} 站段"
+                f"被线路区段停运封锁（{detail}），车辆无法穿越；"
+                f"本次乘车最远可在 {self.sname(seg_from)} 下车，"
+                "之后需步行或换乘其他班次。"
+            ),
+        }
+
+    def _blk_alight_closed(self, trip: dict, target: str, arrive_at: int,
+                           win: dict | None) -> dict:
+        return {
+            "kind": "station_closed", "action": "alight",
+            "station": target, "time": arrive_at,
+            "trip_id": trip["id"], "window": win,
+            "message": (
+                f"班次 {trip['id']}（{trip['route']}）于 {to_hhmm(arrive_at)} "
+                f"到达 {self.sname(target)}，该站正处于临时停运时段"
+                f"{self._window_text(win)}，班次跳站通过，不能下车。"
+            ),
+        }
+
     def plan(self, origin: str, destination: str, earliest: int,
              preference: str) -> dict:
         if origin not in self.names:
@@ -533,16 +626,8 @@ class Planner:
                 arrival = ready + minutes
                 open_now, win = self.station_open(neighbor, arrival)
                 if not open_now:
-                    record({
-                        "kind": "station_closed", "action": "walk",
-                        "station": neighbor, "time": arrival,
-                        "trip_id": None, "window": win,
-                        "message": (
-                            f"步行 {self.sname(station)}→{self.sname(neighbor)} 于 "
-                            f"{to_hhmm(arrival)} 到达 {self.sname(neighbor)}，但该站处于"
-                            f"临时停运时段{self._window_text(win)}，无法进入换乘。"
-                        ),
-                    })
+                    record(self._blk_walk_closed(station, neighbor, arrival,
+                                                 win))
                     continue
                 try_extend(label, neighbor, arrival, label["rides"],
                            label["walk"] + minutes, label["ridden"],
@@ -562,31 +647,14 @@ class Planner:
                 # 本站上车时站点必须开放
                 open_board, win_board = self.station_open(station, dep)
                 if not open_board:
-                    record({
-                        "kind": "station_closed", "action": "board",
-                        "station": station, "time": dep,
-                        "trip_id": trip_id, "window": win_board,
-                        "message": (
-                            f"拟于 {to_hhmm(dep)} 在 {self.sname(station)} 乘坐班次 "
-                            f"{trip_id}（{trip['route']}），但该站此时处于临时停运时段"
-                            f"{self._window_text(win_board)}，不能上车。"
-                        ),
-                    })
+                    record(self._blk_board_closed(station, dep, trip,
+                                                  win_board))
                     continue
                 # 线路在该发车时刻处于停运区间：跳过整个班次
                 open_route, win_route = self.route_open(trip["route"], dep)
                 if not open_route:
-                    record({
-                        "kind": "route_suspended", "action": "board",
-                        "station": station, "time": dep,
-                        "trip_id": trip_id, "window": win_route,
-                        "route": trip["route"],
-                        "message": (
-                            f"班次 {trip_id}（{trip['route']}）原定于 {to_hhmm(dep)} 从 "
-                            f"{self.sname(station)} 发车，但线路在临时停运区间"
-                            f"{self._window_text(win_route)}内，该班次被跳过。"
-                        ),
-                    })
+                    record(self._blk_route_suspended(station, dep, trip,
+                                                     win_route))
                     continue
 
                 # 延伸到后续每个（到站时开放的）经停站；停运站跳站通过。
@@ -599,49 +667,15 @@ class Planner:
                         break
                     closure = self.segment_closure(trip_id, j - 1)
                     if closure is not None:
-                        seg_from = trip["stops"][j - 1]["station"]
-                        seg_to = trip["stops"][j]["station"]
-                        detail = (
-                            f"{trip['route']} {self.sname(closure['from'])}→"
-                            f"{self.sname(closure['to'])} "
-                            f"{to_hhmm(closure['start'])}–"
-                            f"{to_hhmm(closure['end'])}")
-                        if closure["label"]:
-                            detail += f"，{closure['label']}"
-                        record({
-                            "kind": "segment_suspended", "action": "ride",
-                            "station": seg_from,
-                            "time": trip["stops"][j - 1]["time"],
-                            "trip_id": trip_id, "route": trip["route"],
-                            "seg_from": seg_from, "seg_to": seg_to,
-                            "window": {"start": closure["start"],
-                                       "end": closure["end"],
-                                       "label": closure["label"]},
-                            "message": (
-                                f"班次 {trip_id}（{trip['route']}）于 "
-                                f"{to_hhmm(trip['stops'][j - 1]['time'])} 到达 "
-                                f"{self.sname(seg_from)} 后，前方 "
-                                f"{self.sname(seg_from)}→{self.sname(seg_to)} 站段"
-                                f"被线路区段停运封锁（{detail}），车辆无法穿越；"
-                                f"本次乘车最远可在 {self.sname(seg_from)} 下车，"
-                                "之后需步行或换乘其他班次。"
-                            ),
-                        })
+                        record(self._blk_segment_suspended(trip, j - 1,
+                                                           closure))
                         break
                     target = trip["stops"][j]["station"]
                     arrive_at = trip["stops"][j]["time"]
                     open_alight, win_alight = self.station_open(target, arrive_at)
                     if not open_alight:
-                        record({
-                            "kind": "station_closed", "action": "alight",
-                            "station": target, "time": arrive_at,
-                            "trip_id": trip_id, "window": win_alight,
-                            "message": (
-                                f"班次 {trip_id}（{trip['route']}）于 {to_hhmm(arrive_at)} "
-                                f"到达 {self.sname(target)}，该站正处于临时停运时段"
-                                f"{self._window_text(win_alight)}，班次跳站通过，不能下车。"
-                            ),
-                        })
+                        record(self._blk_alight_closed(trip, target, arrive_at,
+                                                       win_alight))
                         new_segments.add(j - 1)
                         continue
                     new_segments.add(j - 1)
@@ -1054,4 +1088,448 @@ class Planner:
             "walking_minutes": walking,
             "waiting_minutes": waiting,
             "legs": out_legs,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 两人同车会合：各自到同一会合站，赶上同一班次，同乘直达共同终点
+    # ------------------------------------------------------------------ #
+    def meet(self, origin_a: str, earliest_a: int, origin_b: str,
+             earliest_b: int, destination: str) -> dict:
+        """为两人规划同车会合行程。
+
+        两人各自从起点（不早于各自最早出发时刻）经乘车 / 步行 / 候车到达
+        同一会合站，赶上同一班次，再同乘该班次直达共同终点。取解字典序：
+        共同到达时刻 → 两人总步行 → 两人总候车（等共同班车的候车分别计入
+        两人）→ 班次 ID → 会合站 ID。对同一（会合站, 班次），每人取「仍赶
+        得上该班次」的前段中步行最少、并列时候车最少的一段，而非其最快
+        前段。找不到双方都赶得上的共同班次时返回未能同行的原因。
+        """
+        for person, origin in (("甲", origin_a), ("乙", origin_b)):
+            if origin not in self.names:
+                raise PlanError(f"{person}的起点站不存在：{origin}")
+        if destination not in self.names:
+            raise PlanError(f"终点站不存在：{destination}")
+        if origin_a == destination:
+            raise PlanError("甲的起点站与终点站相同，无需同车会合规划")
+        if origin_b == destination:
+            raise PlanError("乙的起点站与终点站相同，无需同车会合规划")
+
+        pa = self._search_profiles(origin_a, earliest_a, "甲")
+        if pa["status"] != "ok":
+            return pa
+        pb = self._search_profiles(origin_b, earliest_b, "乙")
+        if pb["status"] != "ok":
+            return pb
+        explored = pa["explored"] + pb["explored"]
+
+        # ---- 候选同乘段：班次在会合站上车、之后经停终点站且区间可通行 ----
+        candidates: list[dict] = []
+        ride_blockers: list[dict] = []  # 同乘段受阻原因（无解归因用）
+        for trip_id in self.n["trip_order"]:
+            trip = self.n["trips"][trip_id]
+            stops = trip["stops"]
+            for j, stop in enumerate(stops):
+                if stop["station"] != destination:
+                    continue
+                arr_dest = stop["time"]
+                open_dest, win_dest = self.station_open(destination, arr_dest)
+                for i in range(j):
+                    meet_station = stops[i]["station"]
+                    dep = stops[i]["time"]
+                    open_board, win_board = self.station_open(meet_station, dep)
+                    if not open_board:
+                        blk = self._blk_board_closed(meet_station, dep, trip,
+                                                     win_board)
+                        ride_blockers.append(blk)
+                        continue
+                    open_route, win_route = self.route_open(trip["route"], dep)
+                    if not open_route:
+                        blk = self._blk_route_suspended(meet_station, dep,
+                                                        trip, win_route)
+                        ride_blockers.append(blk)
+                        continue
+                    if not open_dest:
+                        blk = self._blk_alight_closed(trip, destination,
+                                                      arr_dest, win_dest)
+                        ride_blockers.append(blk)
+                        continue
+                    closed_seg = None
+                    for k in range(i, j):
+                        clo = self.segment_closure(trip_id, k)
+                        if clo is not None:
+                            closed_seg = (k, clo)
+                            break
+                    if closed_seg is not None:
+                        blk = self._blk_segment_suspended(
+                            trip, closed_seg[0], closed_seg[1])
+                        ride_blockers.append(blk)
+                        continue
+                    candidates.append({
+                        "meet": meet_station, "trip_id": trip_id,
+                        "route": trip["route"], "board": dep,
+                        "arrive": arr_dest,
+                    })
+
+        # ---- 逐候选评估：两人在会合站各取最优前段，按字典序比较整解 ----
+        solutions: list[tuple] = []
+        misses: list[tuple] = []
+        for cand in candidates:
+            la = self._best_prefix(pa["labels"].get(cand["meet"], ()),
+                                   cand["board"])
+            lb = self._best_prefix(pb["labels"].get(cand["meet"], ()),
+                                   cand["board"])
+            if la is not None and lb is not None:
+                walk = la["walk"] + lb["walk"]
+                wait = (la["wait"] + cand["board"] - la["arrival"]
+                        + lb["wait"] + cand["board"] - lb["arrival"])
+                key = (cand["arrive"], walk, wait,
+                       cand["trip_id"], cand["meet"])
+                solutions.append((key, cand, la, lb))
+            else:
+                misses.append((cand, la, lb))
+
+        if solutions:
+            solutions.sort(key=lambda s: s[0])
+            _, cand, la, lb = solutions[0]
+            meetup = self._meetup_result(cand, la, lb, origin_a, earliest_a,
+                                         origin_b, earliest_b, destination)
+            return {"status": "ok", "explored": explored, "meetup": meetup}
+
+        blocker = self._meet_blocker(destination, candidates, misses,
+                                     ride_blockers, pa, pb,
+                                     origin_a, earliest_a,
+                                     origin_b, earliest_b)
+        return {"status": "blocked", "blocker": blocker,
+                "explored": explored}
+
+    @staticmethod
+    def _best_prefix(labels, board: int) -> dict | None:
+        """会合站处不晚于 board 到达的前段中，按 (步行, 候车−到达) 字典序
+        取最优（候车−到达 越小，等到共同班次发车后的总候车越少）。"""
+        best = None
+        best_key = None
+        for lb in labels:
+            if lb["arrival"] > board:
+                continue
+            key = (lb["walk"], lb["wait"] - lb["arrival"], lb["uid"])
+            if best_key is None or key < best_key:
+                best_key, best = key, lb
+        return best
+
+    def _search_profiles(self, origin: str, earliest: int,
+                         person: str) -> dict:
+        """从 (origin, earliest) 出发，为每个站点求会合前段的帕累托标签。
+
+        标签携带 (到达时刻, 累计步行, 累计候车)。对任一共同班次发车时刻 D，
+        前段可行当且仅当 到达 ≤ D，其代价按 (步行, 候车 + (D − 到达)) 字典序
+        参与两人总代价比较；因此支配关系为：到达不更晚、且
+        (步行, 候车 − 到达) 字典序不劣、且至少一项严格——较晚到达但步行
+        更少的前段不会被剪枝（它可能仍赶得上同一班次且更优）。
+        此外，步行进入邻站要通过站点停运检查，而封站窗口有结束时刻：
+        较早到达走完步行时邻站可能仍在封站，较晚到达反而能进入。故支配
+        还要求：对每条步行边，若较早标签走完步行时邻站封站，则较晚标签
+        走完时也必须仍在封站（否则保留较晚标签）。
+        """
+        open_at_start, window = self.station_open(origin, earliest)
+        if not open_at_start:
+            return {"status": "blocked", "blocker": {
+                "kind": "origin_closed", "action": "start", "station": origin,
+                "time": earliest, "window": window, "person": person,
+                "message": (
+                    f"{person}的起点站 {self.sname(origin)} 在 "
+                    f"{to_hhmm(earliest)} 处于临时停运时段"
+                    f"{self._window_text(window)}，无法出发，两人未能同行。"
+                ),
+            }}
+
+        # 各站点的步行到达封站风险：(步行分钟, 邻站封站窗口列表)
+        walk_risks: dict[str, list] = {}
+        for sid in self.n["stations"]:
+            risks = []
+            for neighbor, minutes in self.n["walk_edges"].get(sid, ()):
+                wins = [(st, en) for st, en, _
+                        in self.n["station_windows"].get(neighbor, ())]
+                if wins:
+                    risks.append((minutes, wins))
+            walk_risks[sid] = risks
+
+        blockers: dict[tuple, dict] = {}
+
+        def record(blocker: dict) -> None:
+            key = (blocker["kind"], blocker.get("action"),
+                   blocker.get("station"), blocker.get("time"),
+                   blocker.get("trip_id"))
+            blockers.setdefault(key, blocker)
+
+        def cost(lb: dict) -> tuple:
+            return (lb["walk"], lb["wait"] - lb["arrival"])
+
+        def dominates(a: dict, b: dict, risks: list) -> bool:
+            if a["arrival"] > b["arrival"]:
+                return False
+            ca, cb = cost(a), cost(b)
+            if not (ca <= cb and (a["arrival"] < b["arrival"] or ca < cb)):
+                return False
+            # a 能走的步行边必须覆盖 b 能走的（封站窗口使可行性非单调）
+            for minutes, wins in risks:
+                ta = a["arrival"] + minutes
+                tb = b["arrival"] + minutes
+                for st, en in wins:
+                    if st <= ta <= en and not st <= tb <= en:
+                        return False
+            return True
+
+        def key_tuple(lb: dict) -> tuple:
+            return (lb["arrival"],) + cost(lb)
+
+        start_label = {"uid": 0, "station": origin, "arrival": earliest,
+                       "walk": 0, "wait": 0, "chain": ()}
+        buckets: dict[str, list[dict]] = {s: [] for s in self.n["stations"]}
+        buckets[origin].append(start_label)
+
+        heap: list[tuple] = [(earliest, 0, start_label)]
+        counter = count(1)
+        explored = 0
+
+        def try_extend(label: dict, station: str, arrival: int, walk: int,
+                       wait: int, step: dict) -> None:
+            new_label = {
+                "uid": next(counter), "station": station,
+                "arrival": arrival, "walk": walk, "wait": wait,
+                "chain": label["chain"] + (step,),
+            }
+            bucket = buckets[station]
+            risks = walk_risks[station]
+            if any(dominates(existing, new_label, risks) or
+                   key_tuple(existing) == key_tuple(new_label)
+                   for existing in bucket):
+                return
+            for existing in list(bucket):
+                if dominates(new_label, existing, risks):
+                    bucket.remove(existing)
+            bucket.append(new_label)
+            heapq.heappush(heap, (arrival, new_label["uid"], new_label))
+
+        while heap:
+            _, uid, label = heapq.heappop(heap)
+            if not any(b["uid"] == uid for b in buckets[label["station"]]):
+                continue  # 已被更优标签支配
+            explored += 1
+            station = label["station"]
+            ready = label["arrival"]
+
+            # ---- 步行换乘边 ----
+            for neighbor, minutes in self.n["walk_edges"].get(station, ()):
+                arrival = ready + minutes
+                open_now, win = self.station_open(neighbor, arrival)
+                if not open_now:
+                    record(self._blk_walk_closed(station, neighbor, arrival,
+                                                 win))
+                    continue
+                try_extend(label, neighbor, arrival,
+                           label["walk"] + minutes, label["wait"],
+                           {"type": "walk", "from": station, "to": neighbor,
+                            "depart": ready, "arrive": arrival,
+                            "minutes": minutes})
+
+            # ---- 班次边（时间依赖：只能赶上 ready 之后的发车）----
+            for trip_id, idx in self.n["departures"].get(station, ()):
+                trip = self.n["trips"][trip_id]
+                dep = trip["stops"][idx]["time"]
+                if dep < ready:
+                    continue
+                open_board, win_board = self.station_open(station, dep)
+                if not open_board:
+                    record(self._blk_board_closed(station, dep, trip,
+                                                  win_board))
+                    continue
+                open_route, win_route = self.route_open(trip["route"], dep)
+                if not open_route:
+                    record(self._blk_route_suspended(station, dep, trip,
+                                                     win_route))
+                    continue
+
+                wait_boarded = label["wait"] + (dep - ready)
+                for j in range(idx + 1, len(trip["stops"])):
+                    closure = self.segment_closure(trip_id, j - 1)
+                    if closure is not None:
+                        record(self._blk_segment_suspended(trip, j - 1,
+                                                           closure))
+                        break
+                    target = trip["stops"][j]["station"]
+                    arrive_at = trip["stops"][j]["time"]
+                    open_alight, win_alight = self.station_open(target,
+                                                                arrive_at)
+                    if not open_alight:
+                        record(self._blk_alight_closed(trip, target,
+                                                       arrive_at, win_alight))
+                        continue
+                    try_extend(label, target, arrive_at, label["walk"],
+                               wait_boarded,
+                               {"type": "ride", "trip_id": trip_id,
+                                "route": trip["route"], "from": station,
+                                "to": target, "depart": dep,
+                                "arrive": arrive_at,
+                                "minutes": arrive_at - dep})
+
+        return {"status": "ok", "labels": buckets, "blockers": blockers,
+                "explored": explored}
+
+    # ------------------------------------------------------------------ #
+    def _meet_person(self, person: str, origin: str, earliest: int,
+                     label: dict, meet_station: str, board: int) -> dict:
+        """拼装一人的会合前时间线：前段各段 + 在会合站等共同班次的候车段。"""
+        legs: list[dict] = []
+        cursor = earliest
+        for step in label["chain"]:
+            if step["depart"] > cursor:
+                legs.append({"type": "wait", "station": step["from"],
+                             "start": cursor, "end": step["depart"],
+                             "minutes": step["depart"] - cursor})
+            leg = dict(step)
+            if leg["type"] == "ride":
+                note = self._truncation_note(leg)
+                if note:
+                    leg["truncated"] = True
+                    leg["truncation"] = note
+            legs.append(leg)
+            cursor = step["arrive"]
+        arrival_at_meet = cursor
+        if board > cursor:
+            legs.append({"type": "wait", "station": meet_station,
+                         "start": cursor, "end": board,
+                         "minutes": board - cursor, "await_shared": True})
+        return {
+            "label": person,
+            "origin": origin,
+            "earliest": earliest,
+            "arrival_at_meet": arrival_at_meet,
+            "walking_minutes": label["walk"],
+            "waiting_minutes": label["wait"] + (board - label["arrival"]),
+            "legs": legs,
+        }
+
+    def _meetup_result(self, cand: dict, la: dict, lb: dict,
+                       origin_a: str, earliest_a: int,
+                       origin_b: str, earliest_b: int,
+                       destination: str) -> dict:
+        """拼装同车会合结果：两人各自会合前时间线 + 只出现一次的同乘段。"""
+        meet_station = cand["meet"]
+        person_a = self._meet_person("甲", origin_a, earliest_a, la,
+                                     meet_station, cand["board"])
+        person_b = self._meet_person("乙", origin_b, earliest_b, lb,
+                                     meet_station, cand["board"])
+        shared = {"type": "ride", "trip_id": cand["trip_id"],
+                  "route": cand["route"], "from": meet_station,
+                  "to": destination, "depart": cand["board"],
+                  "arrive": cand["arrive"],
+                  "minutes": cand["arrive"] - cand["board"],
+                  "shared": True}
+        return {
+            "destination": destination,
+            "meet_station": meet_station,
+            "trip_id": cand["trip_id"],
+            "route": cand["route"],
+            "board_time": cand["board"],
+            "arrival": cand["arrive"],
+            "walking_minutes": (person_a["walking_minutes"]
+                                + person_b["walking_minutes"]),
+            "waiting_minutes": (person_a["waiting_minutes"]
+                                + person_b["waiting_minutes"]),
+            "persons": [person_a, person_b],
+            "shared": shared,
+        }
+
+    # ------------------------------------------------------------------ #
+    def _meet_miss_reason(self, person: str, origin: str, earliest: int,
+                          profile: dict, cand: dict) -> tuple:
+        """某人在某候选同乘段上未能同行的原因：(迟到分钟数或None, 描述)。"""
+        meet_station = cand["meet"]
+        labels = profile["labels"].get(meet_station) or []
+        if labels:
+            earliest_arrival = min(lb["arrival"] for lb in labels)
+            return (
+                earliest_arrival - cand["board"],
+                f"{person}最早也要 {to_hhmm(earliest_arrival)} 才能到达 "
+                f"{self.sname(meet_station)}，赶不上 "
+                f"{to_hhmm(cand['board'])} 发车的班次 "
+                f"{cand['trip_id']}（{cand['route']}）")
+        first = self._first_blocker(profile["blockers"], origin,
+                                    meet_station, earliest,
+                                    start_noun=f"{person}的起点站",
+                                    start_action="start")
+        return (None, f"{person}无法从 {self.sname(origin)} 到达 "
+                      f"{self.sname(meet_station)}——{first['message']}")
+
+    def _meet_blocker(self, destination: str, candidates: list,
+                      misses: list, ride_blockers: list,
+                      pa: dict, pb: dict,
+                      origin_a: str, earliest_a: int,
+                      origin_b: str, earliest_b: int) -> dict:
+        """会合无解时归因：绝不把任一方单独到达终点的路线当作同行方案。"""
+        dest_name = self.sname(destination)
+        earliest = min(earliest_a, earliest_b)
+
+        if not self.n["departures"].get(destination):
+            return {
+                "kind": "no_service", "action": "end",
+                "station": destination, "time": earliest,
+                "trip_id": None, "window": None,
+                "message": (f"终点站 {dest_name} 没有任何经停班次，"
+                            "两人无法同车到达。"),
+            }
+
+        if not candidates:
+            if ride_blockers:
+                first = min(ride_blockers, key=lambda b: (
+                    b.get("time", earliest), str(b.get("station", "")),
+                    str(b.get("trip_id", ""))))
+                return {
+                    "kind": "no_shared_ride", "action": "ride",
+                    "station": destination, "time": first.get("time"),
+                    "trip_id": first.get("trip_id"),
+                    "cause": first.get("kind"),
+                    "message": (
+                        f"没有任何班次能在某一车站接上两人并直达终点站 "
+                        f"{dest_name}，两人未能同行。首个受阻的共同班次："
+                        f"{first['message']}"),
+                }
+            return {
+                "kind": "no_shared_ride", "action": "ride",
+                "station": destination, "time": earliest, "trip_id": None,
+                "message": (
+                    f"没有任何班次能在某一车站接上两人并直达终点站 "
+                    f"{dest_name}，两人未能同行。"),
+            }
+
+        # 有可行同乘段但每个候选都至少有一人赶不上：报告最接近的方案
+        best = None
+        for cand, la, lb in misses:
+            reasons: list[str] = []
+            lateness: list[int] = []
+            for person, origin, earliest_p, profile, lbl in (
+                    ("甲", origin_a, earliest_a, pa, la),
+                    ("乙", origin_b, earliest_b, pb, lb)):
+                if lbl is not None:
+                    continue
+                late, reason = self._meet_miss_reason(
+                    person, origin, earliest_p, profile, cand)
+                reasons.append(reason)
+                lateness.append(late if late is not None else DAY_MINUTES * 2)
+            key = (len(reasons), max(lateness), cand["board"],
+                   cand["trip_id"], cand["meet"])
+            if best is None or key < best[0]:
+                best = (key, cand, reasons)
+        _, cand, reasons = best
+        return {
+            "kind": "no_common_trip", "action": "meet",
+            "station": cand["meet"], "time": cand["board"],
+            "trip_id": cand["trip_id"], "route": cand["route"],
+            "message": (
+                f"两人未能赶上同一班直达 {dest_name} 的车次。最接近的方案"
+                f"是在 {self.sname(cand['meet'])} 会合，乘班次 "
+                f"{cand['trip_id']}（{cand['route']}，"
+                f"{to_hhmm(cand['board'])} 发车，"
+                f"{to_hhmm(cand['arrive'])} 到达），"
+                f"但{'；'.join(reasons)}。"),
         }

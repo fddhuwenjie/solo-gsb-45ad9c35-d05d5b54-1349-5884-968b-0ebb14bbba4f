@@ -88,13 +88,39 @@
         <span id="recalc-hint" class="recalc-hint" hidden>输入已变更，结果待重算…</span>
       </div>
 
+      <div class="card meet-card">
+        <h2>⑥ 两人同车会合</h2>
+        <p class="hint meet-hint">
+          两人各自出发，先到同一会合站赶上同一班次，再同乘该班次直达共同终点；
+          等共同班次的候车分别计入两人。
+        </p>
+        <div class="plan-grid">
+          <label>甲起点站
+            <select id="m-origin-a"></select>
+          </label>
+          <label>甲最早出发
+            <input id="m-earliest-a" type="time" value="08:00" />
+          </label>
+          <label>乙起点站
+            <select id="m-origin-b"></select>
+          </label>
+          <label>乙最早出发
+            <input id="m-earliest-b" type="time" value="08:00" />
+          </label>
+          <label>共同终点站
+            <select id="m-destination"></select>
+          </label>
+        </div>
+        <button id="btn-meet" type="button" class="primary">规划同行</button>
+      </div>
+
       <div class="card result-card">
-        <h2>⑥ 规划结果</h2>
+        <h2>⑦ 规划结果</h2>
         <div id="result">
           <p class="empty">录入站点与班次后点击「规划行程」。</p>
         </div>
         <div id="continue-panel" class="continue-panel" hidden>
-          <h3>⑦ 行程续程（途中停运 / 班次调整后接续）</h3>
+          <h3>⑧ 行程续程（途中停运 / 班次调整后接续）</h3>
           <p class="hint" id="continue-hint">
             在下方时间线中选定最后完成的乘车或步行段、填写当前时刻，
             并先在左侧修改站点 / 班次 / 停运信息，再发起续程。

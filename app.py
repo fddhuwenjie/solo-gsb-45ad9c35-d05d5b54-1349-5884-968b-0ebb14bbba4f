@@ -87,5 +87,33 @@ def continue_trip():
     return jsonify(result)
 
 
+@app.post("/api/meet")
+def meet():
+    """两人同车会合：各自到同一会合站，同乘一班直达共同终点。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error",
+                        "message": "请求体必须是 JSON 对象"}), 400
+
+    query = payload.get("query") or {}
+    data = payload.get("data") or {}
+
+    try:
+        network = normalize(data)
+        origin_a = str(query.get("origin_a", "")).strip()
+        origin_b = str(query.get("origin_b", "")).strip()
+        destination = str(query.get("destination", "")).strip()
+        earliest_a = parse_time(query.get("earliest_a", "00:00"),
+                                "甲的最早出发时刻")
+        earliest_b = parse_time(query.get("earliest_b", "00:00"),
+                                "乙的最早出发时刻")
+        result = Planner(network).meet(origin_a, earliest_a,
+                                       origin_b, earliest_b, destination)
+    except PlanError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

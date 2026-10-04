@@ -295,6 +295,40 @@ textarea.stops {
 }
 .chip.cont strong { color: var(--ok); }
 
+/* ---- 两人同车会合 ---- */
+.meet-card .meet-hint { margin: 0 0 12px; display: block; }
+.meet-person {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.meet-person h3, .meet-shared h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.meet-person .summary { margin: 6px 0 10px; }
+.meet-shared {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.shared-flag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 0 6px;
+  margin-left: 6px;
+  vertical-align: 1px;
+  background: rgba(52, 211, 153, .18);
+  color: var(--ok);
+}
+.shared-flag.wait { background: rgba(79, 156, 255, .16); color: var(--accent); }
+
 .footer {
   text-align: center;
   color: var(--muted);

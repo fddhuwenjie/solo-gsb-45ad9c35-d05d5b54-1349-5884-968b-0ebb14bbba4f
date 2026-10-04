@@ -20,6 +20,11 @@ const els = {
   destination: $("#q-destination"),
   earliest: $("#q-earliest"),
   preference: $("#q-preference"),
+  meetOriginA: $("#m-origin-a"),
+  meetOriginB: $("#m-origin-b"),
+  meetEarliestA: $("#m-earliest-a"),
+  meetEarliestB: $("#m-earliest-b"),
+  meetDestination: $("#m-destination"),
   result: $("#result"),
   recalc: $("#recalc-hint"),
   fileImport: $("#file-import"),
@@ -188,6 +193,20 @@ function syncSelects() {
   else if (data.stations.length)
     els.destination.value = data.stations[Math.min(1, data.stations.length - 1)].id;
   if (!els.origin.value && data.stations.length) els.origin.value = data.stations[0].id;
+  // 会合面板的下拉与主规划共用站点表，各自记忆已选值
+  const meetSels = [els.meetOriginA, els.meetOriginB, els.meetDestination];
+  const prevs = meetSels.map((el) => el.value);
+  meetSels.forEach((el, i) => {
+    el.innerHTML = stationOptions();
+    if ([...el.options].some((o) => o.value === prevs[i])) el.value = prevs[i];
+  });
+  if (!els.meetOriginA.value && data.stations.length)
+    els.meetOriginA.value = data.stations[0].id;
+  if (!els.meetOriginB.value && data.stations.length)
+    els.meetOriginB.value =
+      data.stations[Math.min(1, data.stations.length - 1)].id;
+  if (!els.meetDestination.value && data.stations.length)
+    els.meetDestination.value = data.stations[data.stations.length - 1].id;
 }
 
 // ---------------------------------------------------------------- 输入变更
@@ -363,6 +382,128 @@ async function runPlan() {
 function showError(message) {
   els.result.innerHTML = `<p class="error-banner">⚠ ${esc(message)}</p>`;
   els.continuePanel.hidden = true;
+}
+
+// ---------------------------------------------------------------- 两人同车会合
+async function runMeet() {
+  // 保存行内尚未失焦的输入
+  document.querySelectorAll(".row").forEach(readRow);
+
+  const body = {
+    data,
+    query: {
+      origin_a: els.meetOriginA.value,
+      origin_b: els.meetOriginB.value,
+      earliest_a: els.meetEarliestA.value || "00:00",
+      earliest_b: els.meetEarliestB.value || "00:00",
+      destination: els.meetDestination.value,
+    },
+  };
+  els.result.innerHTML = `<p class="empty">搜索中…</p>`;
+  let res;
+  try {
+    const resp = await fetch("/api/meet", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    res = await resp.json();
+  } catch (err) {
+    return showError(`请求失败：${err.message}`);
+  }
+  if (res.status === "error") return showError(res.message);
+  lastResult = res;
+  stale = false;
+  els.recalc.hidden = true;
+  continueReq = null;
+  renderMeetup(res);
+}
+
+function renderMeetup(res) {
+  // 会合结果不支持行程续程（续程仍只面向单人行程）
+  els.continuePanel.hidden = true;
+  if (res.status === "blocked") {
+    els.result.innerHTML = `
+      <div class="blocked">
+        <span class="badge">未能同行</span>
+        <p>${esc(res.blocker.message)}</p>
+      </div>`;
+    return;
+  }
+  const mu = res.meetup;
+  const personsHtml = mu.persons
+    .map((p) => {
+      const legs = p.legs.map((l) => renderMeetLegLi(l)).join("");
+      return `
+      <div class="meet-person">
+        <h3>${esc(p.label)} · 会合前行程
+          <span class="hint">${esc(sname(p.origin))} 出发，不早于 ${hhmm(p.earliest)}</span>
+        </h3>
+        <div class="summary">
+          <span class="chip">到达会合站 <strong>${hhmm(p.arrival_at_meet)}</strong></span>
+          <span class="chip">步行 <strong>${p.walking_minutes}</strong> 分钟</span>
+          <span class="chip">候车 <strong>${p.waiting_minutes}</strong> 分钟</span>
+        </div>
+        ${p.legs.length
+          ? `<ul class="timeline">${legs}</ul>`
+          : `<p class="empty">起点即会合站，共同班次发车时直接上车。</p>`}
+      </div>`;
+    })
+    .join("");
+  const s = mu.shared;
+  els.result.innerHTML = `
+    <div class="station-endpoint">
+      在 ${esc(sname(mu.meet_station))} 会合，同乘 ${esc(mu.route)} · 班次
+      ${esc(mu.trip_id)}（${hhmm(mu.board_time)} 发车）直达
+      ${esc(sname(mu.destination))}
+    </div>
+    <div class="summary">
+      <span class="chip ok">共同到达 <strong>${hhmm(mu.arrival)}</strong></span>
+      <span class="chip">会合站 <strong>${esc(sname(mu.meet_station))}</strong></span>
+      <span class="chip">两人总步行 <strong>${mu.walking_minutes}</strong> 分钟</span>
+      <span class="chip">两人总候车 <strong>${mu.waiting_minutes}</strong> 分钟</span>
+    </div>
+    ${personsHtml}
+    <div class="meet-shared">
+      <h3>同乘段（两人同行，只计一次）</h3>
+      <ul class="timeline">
+        <li class="leg ride">
+          <span class="dot">乘</span>
+          <div class="when">${hhmm(s.depart)} 发车 · ${hhmm(s.arrive)} 到达（${s.minutes} 分钟）</div>
+          <div class="what">${esc(s.route)} · 班次 ${esc(s.trip_id)}
+            <span class="shared-flag">两人同乘</span></div>
+          <div class="meta">${esc(sname(s.from))} 上车 → ${esc(sname(s.to))} 下车</div>
+        </li>
+      </ul>
+    </div>`;
+}
+
+function renderMeetLegLi(l) {
+  const cls = ["leg", l.type].join(" ");
+  let body;
+  if (l.type === "wait") {
+    body = `
+      <span class="dot">等</span>
+      <div class="when">${hhmm(l.start)} – ${hhmm(l.end)}（${l.minutes} 分钟）</div>
+      <div class="what">${l.await_shared ? "候车等共同班次" : "站内候车"}
+        ${l.await_shared ? `<span class="shared-flag wait">会合候车</span>` : ""}</div>
+      <div class="meta">在 ${esc(sname(l.station))} 等待${
+        l.await_shared ? "共同班次发车" : "下一班"}</div>`;
+  } else if (l.type === "walk") {
+    body = `
+      <span class="dot">走</span>
+      <div class="when">${hhmm(l.depart)} – ${hhmm(l.arrive)}（${l.minutes} 分钟）</div>
+      <div class="what">步行换乘：${esc(sname(l.from))} → ${esc(sname(l.to))}</div>
+      <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>`;
+  } else {
+    body = `
+      <span class="dot">乘</span>
+      <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
+      <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)}</div>
+      <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
+      ${l.truncated ? `<div class="meta trunc">⚠ ${esc(l.truncation)}</div>` : ""}`;
+  }
+  return `<li class="${cls}">${body}</li>`;
 }
 
 // ---------------------------------------------------------------- 行程续程
@@ -559,7 +700,9 @@ async function loadSample() {
   renderAll();
   els.earliest.value = "08:00";
   els.preference.value = "fastest";
-  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」。</p>`;
+  els.meetEarliestA.value = "08:00";
+  els.meetEarliestB.value = "08:00";
+  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」或「规划同行」。</p>`;
   els.continuePanel.hidden = true;
   els.recalc.hidden = true;
 }
@@ -613,7 +756,10 @@ $("#btn-clear").addEventListener("click", clearAll);
 $("#btn-export").addEventListener("click", exportJson);
 $("#btn-import").addEventListener("click", () => els.fileImport.click());
 $("#btn-plan").addEventListener("click", runPlan);
-[els.origin, els.destination, els.earliest, els.preference].forEach((el) =>
+$("#btn-meet").addEventListener("click", runMeet);
+[els.origin, els.destination, els.earliest, els.preference,
+ els.meetOriginA, els.meetOriginB, els.meetEarliestA, els.meetEarliestB,
+ els.meetDestination].forEach((el) =>
   el.addEventListener("change", markStale)
 );
 
